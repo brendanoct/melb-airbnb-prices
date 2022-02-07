@@ -1,0 +1,251 @@
+---
+title: "Predicting Airbnb Prices"
+author: "Brendan Octaviano"
+date: "02/02/2022"
+output: github_document
+---
+
+# Introduction
+
+In October 2021, Melbourne, previously the worlds most livable city, and at the same time the [most locked down city](https://www.reuters.com/world/asia-pacific/melbourne-reopens-worlds-most-locked-down-city-eases-pandemic-restrictions-2021-10-21/), came out of 262 days of lockdown for what is hopefully the final time. As a result, people are eager to travel and get out of the area they have been locked down in for so long. 
+
+Airbnb, a popular vacation rental company, connects people who are looking to travel, with people who are looking for accommodation in specific places. While [Airbnb services in Melbourne have had some negative reviews recently due to COVID-19 restrictions and cancellation policies](https://www.abc.net.au/news/2021-11-30/airbnb-stayz-covid-cancellation-refund-bookings/100658860), with the end of lockdowns, hopefully this will no longer occur, and people can go back to enjoying their holidays. 
+
+# Our Data
+
+Analysing Airbnb data in Melbourne from [Inside Airbnb](http://insideairbnb.com/get-the-data.html), we look to explore *how well we can predict the prices of properties listed on Airbnb*. 
+
+```{r, message = FALSE, warning = FALSE}
+
+#Setting seed for reproducability
+set.seed(30127)
+
+#Loading packages 
+library(tidyverse)
+library(geosphere)
+library(caret)
+library(knitr)
+library(tidymodels)
+
+#Loading the data
+airbnb <- read.csv("listings.csv")
+
+#Initial clean
+airbnb_clean <- airbnb %>%
+  #Selecting only numerical columns that are useful for our analysis
+  select(latitude, longitude, bathrooms_text, bedrooms, reviews_per_month, review_scores_rating, host_total_listings_count, maximum_nights, price) %>%
+  mutate(
+    #Clean up price column and remove "$"
+    price = str_replace_all(price, "\\$", ""),
+    #Removing any "," in price column as well
+    price = str_replace_all(price, ",", ""),
+    #Creating new column with only number of bathrooms, removing the text
+    bathrooms = str_extract(bathrooms_text, "\\d+\\.?\\d*")
+  ) %>%
+  #Ensuring all of our columns are in a numeric format
+  mutate_all(as.numeric) 
+
+#Calculating the distance to the city using latitude and longitude from
+#LatLong.net (https://www.latlong.net/place/melbourne-vic-australia-27235.html)
+dist_mat <- data.frame(airbnb_long = airbnb_clean$longitude,
+                       airbnb_lat = airbnb_clean$latitude,
+                       melb_long = rep(144.946457, length(airbnb_clean$longitude)),
+                       melb_lat = rep(-37.840935, length(airbnb_clean$longitude))) %>%
+  rowwise %>%
+  mutate(distance_to_city = distm(x = c(airbnb_long, airbnb_lat), 
+                                  y = c(melb_long, melb_lat), 
+                                  #Dividng by 1000 to get distance in kilometres
+                                  fun = distGeo) / 1000)
+
+
+#Final Clean
+airbnb_clean <- airbnb_clean %>%
+  #Adding our calculated distances
+  bind_cols(distance_to_city = dist_mat$distance_to_city) %>%
+  #Only selecting our needed columns
+  select(bathrooms, bedrooms, reviews_per_month, review_scores_rating, host_total_listings_count, maximum_nights, distance_to_city, price) %>%
+  #Removing any NA or blank values
+  drop_na()
+
+head(airbnb_clean) %>%
+  kable()
+
+```
+
+# Methodology: K-Nearest Neighbours and Hyperparameter Optimisation
+
+**K-Nearest Neighbours (k-NN)** is a supervised machine learning technique that can be used for both regression and classification, however in this case we have used it for regression. Using **k-NN** for regression provides us an output based on the average value of the "nearest neighbours" of an object, where "near" is determined with the concept of distance. Distance, in a literal sense, measures how far one thing is from another, however in the world of machine learning, it refers to how similar (or dissimilar) two observations are. The larger the distance between two observations, the less similar they are, and vice versa.
+
+By calculating the Euclidian distance between objects based on defined variables, **k-NN** looks to find the a specified number of the most similar objects, and in the case of regression, find the average of these labels. Using **k-NN** will allow us to take a number of important variables from our data, use this data to find Airbnb properties that have similar characteristics, then average these out to make our prediction of their price. 
+
+At the same time, we will use **hyperparameter optimisation** to find the optimal value of k for our **k-NN** model. **Hyperparameter optimaisation** will take our training set, divide it into a set number of folds, and will use **[k-fold cross-validation](https://github.com/brendanoct/nyc-house-prices)** to calculate the error metrics for each potential value of k for our **k-NN** model. This will become our *validation error metric* - specifically root mean square error (RMSE) - and the value of k that gives us our lowest RMSE will be our considered our *optimal value of k*. 
+
+# Model
+
+```{r}
+
+#Splitting the data
+airbnb_split <- initial_split(airbnb_clean)
+#Using the split data to create our training set
+airbnb_train <- training(airbnb_split)
+#Using the split data to create our test set
+airbnb_test <- testing(airbnb_split)
+
+#Defining that we want to use cross validation with 5 folds when evaluating our k-nearest neighbours model
+train_control <- trainControl(method = "cv",
+                              number = 5)
+#Creating a grid of possible tuning values
+knn_grid <- expand.grid(k = 1:100)
+
+#Creating k-nearest neighbours model
+knn_model <- train(price ~.,  
+                   data = airbnb_train,
+                   method = "knn",
+                   trControl = train_control,
+                   #Standardising our numerical values to ensure no single variable overpowers the formula
+                   preProcess = c("center", "scale"),
+                   tuneGrid = knn_grid
+                   )
+
+knn_model
+
+```
+
+## Evaluating model
+
+```{r}
+
+plot(knn_model)
+
+```
+
+Looking at the above plot, it is difficult to see the optimal value of k. After conducting hyperparameter optimsation, the *optimal value of k = 95*. This is more clear in the above output from our **k-NN** model, where we can see that the RMSE continues to decrease until k reaches 95, then following 95 the RMSE begins to decrease.
+
+```{r}
+
+#Creating our predictions on our testing set
+predictions <- predict(knn_model, airbnb_test) %>%
+  as_tibble()
+
+#Printing our results for our model
+airbnb_test %>%
+  bind_cols(predictions) %>%
+  metrics(truth = price, estimate = value) %>%
+  kable()
+
+```
+
+Since we are measuring how well we can predict the price of an Airbnb in Melbourne, and since the RMSE can be used to penalise large errors, we can look at the Mean Absolute Error (MAE) to evaluate the performance of our model. The MAE tells us that on average, our model will predict the price of the Airbnb with a distance of \$92.84, or in other words, *we will predict the price with an average error of \$92.84, either more or less*. 
+
+```{r}
+
+#Calculating the range of the prices of our Airbnb's
+
+tibble(min = range(airbnb_clean$price)[1],
+       max = range(airbnb_clean$price)[2]) %>%
+  kable()
+
+```
+
+Since we have quite a large range of different prices for Airbnb's in Melbourne, it appears our model does a fairly good job of predicting the prices. 
+
+## Outliers
+
+```{r, message = FALSE, warning = FALSE}
+
+#Getting our five number summary to calculate outliers
+summary_stats <- summary(airbnb_clean$price)
+
+#(1.5 * IQR) + 3rd Quartile
+outlier <- (1.5 * (summary_stats[[5]] - summary_stats[[2]])) + summary_stats[[5]]
+
+airbnb_clean %>%
+  ggplot(aes(x = price)) +
+  geom_histogram(bins = 50) +
+  labs(x = "Price",
+       y = "Count",
+       title = "Distribution of the different prices of Airbnb properties in Melbourne") +
+  theme_bw()
+
+airbnb_clean %>%
+  filter(price > outlier) %>%
+  ggplot(aes(x = price)) +
+  geom_histogram() +
+  ylim(0, 50) +
+  labs(x = "Price",
+       y = "Count",
+       title = "Distribution of the different prices of Airbnb properties in Melbourne considered \n outliers") +
+  theme_bw()
+
+```
+
+As we can see in the above plots, there are some heavy outliers, that may be potentially skewing the performance of our model. It is not beneficial for us to remove these as if we do not have them, however, it would be interesting to see how our model performs after removing the outliers. 
+
+# Model 2
+
+```{r}
+
+#Removing outliers
+airbnb_clean1 <- airbnb_clean %>%
+  filter(price < outlier)
+
+#Splitting the data
+airbnb_split1 <- initial_split(airbnb_clean1)
+#Using the split data to create our training set
+airbnb_train1 <- training(airbnb_split1)
+#Using the split data to create our test set
+airbnb_test1 <- testing(airbnb_split1)
+
+#Defining that we want to use cross validation with 5 folds when evaluating our k-nearest neighbours model
+train_control1 <- trainControl(method = "cv",
+                              number = 5)
+#Creating a grid of possible tuning values
+knn_grid1 <- expand.grid(k = 1:40)
+
+#Creating k-nearest neighbours model
+knn_model1 <- train(price ~.,  
+                   data = airbnb_train1,
+                   method = "knn",
+                   trControl = train_control1,
+                   #Standardising our numerical values to ensure no single variable overpowers the formula
+                   preProcess = c("center", "scale"),
+                   tuneGrid = knn_grid1
+                   )
+
+knn_model1
+
+```
+
+## Evaluating second model
+
+```{r}
+
+plot(knn_model1)
+
+```
+
+Looking at the above plot we can see much clearer the optimal value for k. Using k = 25 is where our RMSE is lowest, and after this number the RMSE increases, implying that our average error increases.
+
+```{r}
+
+#Creating our predictions on our testing set
+predictions1 <- predict(knn_model1, airbnb_test1) %>%
+  as_tibble()
+
+#Printing our results for our model
+airbnb_test1 %>%
+  bind_cols(predictions1) %>%
+  metrics(truth = price, estimate = value) %>%
+  kable()
+
+```
+
+Similar to our first model, MAE tells us that on average, our model will predict the price of the Airbnb with a distance of \$43.34, or in other words, **we will predict the price with an average error of \$43.34, either more or less, for those properties that are less than \$380.**
+
+At the same time $R^2$ has significantly increased, with approximately 44.10% of the variation in price of Airbnb's in Melbourne can be explained by the variables we have chosen. 
+
+# Conclusion
+
+After our analysis, we were able to not only gain an insight into the different prices of Airbnb properties in Melbourne, but we were able to create a model that attempts to predict the prices of these properties. As Melbourne continues to open back up by easing restrictions, we hope this model can be useful to those who may be looking to take a holiday somewhere in Melbourne, allowing them to see what the price should be based on already active listings. 
+
+One improvement that could be made to the model is a slight variation on the distance to the city variable created. For those looking to stay closer to the Central Business District (CBD) of Melbourne, this is an important variable to consider, however a number of Airbnb properties may be further from the CBD, and instead closer to other popular areas, like the beaches on the Mornington Peninsula, or the Dandenong Ranges. Just because these properties are further from the city, does not mean that this should affect price, as they are closer to other desirable areas that aren't the CBD. 
